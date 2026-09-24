@@ -1,43 +1,61 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:liga_country_sur/data/repository.dart';
 import 'package:liga_country_sur/main.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-const _html = '''
-<select><option value="1">Primera A</option><option value="2">Primera B</option>
-<option value="3">Primera C</option></select>
-<h3>Posiciones</h3>
-<table><tr><th>Equipo</th><th>PJ</th><th>PTS</th></tr>
-<tr><td>San Eliseo</td><td>5</td><td>13</td></tr></table>
-''';
+String _fixture(String nombre) =>
+    File('test/fixtures/$nombre').readAsStringSync();
 
 void main() {
-  testWidgets('muestra la tabla de posiciones de Primera B', (tester) async {
+  testWidgets('navega Inicio, Fixture y Torneos con datos reales', (
+    tester,
+  ) async {
     SharedPreferences.setMockInitialValues({});
-    final client = MockClient(
-      (req) async => http.Response(
-        _html,
-        200,
-        headers: {'content-type': 'text/html; charset=utf-8'},
-      ),
-    );
-    await tester.runAsync(() async {
-      await tester.pumpWidget(
-        MaterialApp(
-          home: HomePage(repo: LigaRepository(client: client)),
-        ),
-      );
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-    });
-    await tester.pumpAndSettle();
-    expect(find.text('San Eliseo'), findsWidgets);
-    expect(find.text('Primera B'), findsWidgets);
+    final repo = LigaRepository(client: _FixtureClient());
 
-    await tester.tap(find.text('Goleadores'));
+    await tester.runAsync(() async {
+      await tester.pumpWidget(LigaApp(repo: repo));
+      await Future<void>.delayed(const Duration(seconds: 2));
+    });
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Liga Country Sur'), findsOneWidget);
+    expect(find.text('COPA DE LIGA PINAMAR'), findsOneWidget);
+
+    await tester.tap(find.text('Torneos'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Clausura 2026'), findsOneWidget);
+    expect(find.text('Primera A'), findsOneWidget);
+
+    await tester.tap(find.text('Primera C'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(seconds: 2)),
+    );
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('PTS'), findsOneWidget);
+
+    await tester.tap(find.text('Fixture').last);
     await tester.pumpAndSettle();
-    expect(find.textContaining('Todavía no hay goleadores'), findsOneWidget);
+    expect(find.byType(ChoiceChip), findsWidgets);
   });
+}
+
+/// Responde con las páginas reales guardadas en test/fixtures.
+class _FixtureClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final path = request.url.path;
+    final body = path.startsWith('/blog')
+        ? _fixture('blog.html')
+        : path.startsWith('/liga/')
+        ? _fixture('campeonato_4315.html')
+        : _fixture('futbol.html');
+    return http.StreamedResponse(Stream.value(utf8.encode(body)), 200);
+  }
 }

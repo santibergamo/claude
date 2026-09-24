@@ -1,31 +1,27 @@
-/// Configuración de la liga y las categorías que muestra la app.
+/// Configuración de la liga.
 class LigaConfig {
-  static const String baseUrl = 'https://ligacountrysur.com.ar/futbol';
+  /// Se puede cambiar con --dart-define=BASE_URL=... (útil para pruebas).
+  static const String baseUrl = String.fromEnvironment(
+    'BASE_URL',
+    defaultValue: 'https://ligacountrysur.com.ar',
+  );
 
-  /// Torneo Clausura 2026.
-  static const int torneo = 329;
+  /// Torneo que se usa si la web no marca ninguno como actual (Clausura 2026).
+  static const int torneoActual = 329;
 
-  /// Campeonato desde el que se descubren las demás categorías del torneo.
-  static const int campeonatoSemilla = 4314;
+  /// IDs de Primera A, B y C del Clausura 2026, por si la web no los lista.
+  static const Map<String, int> primerasPorDefecto = {
+    'A': 4313,
+    'B': 4314,
+    'C': 4315,
+  };
 
-  static const String tituloTorneo = 'Clausura 2026';
+  static Uri get urlFutbol => Uri.parse('$baseUrl/futbol');
+  static Uri get urlNoticias => Uri.parse('$baseUrl/blog');
 
-  static const List<Categoria> categorias = [
-    Categoria(letra: 'A', nombre: 'Primera A'),
-    Categoria(letra: 'B', nombre: 'Primera B'),
-    Categoria(letra: 'C', nombre: 'Primera C'),
-  ];
+  static Uri urlCampeonato(int campeonato, int torneo) =>
+      Uri.parse('$baseUrl/liga/tabla-resultados-alt/$campeonato/$torneo');
 
-  static Uri urlCampeonato(int campeonato) =>
-      Uri.parse('$baseUrl?torneo=$torneo&campeonato=$campeonato');
-}
-
-class Categoria {
-  const Categoria({required this.letra, required this.nombre, this.campeonato});
-
-  final String letra;
-  final String nombre;
-
-  /// ID fijo del campeonato. Si es null se busca en la web de la liga.
-  final int? campeonato;
+  static Uri urlWeb(int campeonato, int torneo) =>
+      Uri.parse('$baseUrl/futbol?torneo=$torneo&campeonato=$campeonato');
 }

@@ -1,216 +1,420 @@
+import 'dart:convert';
+
 import 'package:html/dom.dart';
 import 'package:html/parser.dart' as html_parser;
 
 import 'models.dart';
 
-/// Lee el HTML de ligacountrysur.com.ar y extrae la información útil.
-///
-/// La estructura exacta de la web puede cambiar, así que el parser no depende
-/// de clases CSS: busca tablas y enlaces, y las clasifica por su contenido.
+/// Lee el HTML de ligacountrysur.com.ar.
 class LigaParser {
-  static final _reCategoria = RegExp(
-    r'''(?:primera|1\s*(?:ra|era|°|º)\.?)\s*(?:division\s*)?["'«“]?\s*([abc])(?![a-z])''',
-  );
-  static final _reCampeonato = RegExp(r'campeonato=(\d+)');
-  static final _reResultado = RegExp(r'^\d{1,2}\s*[-–:]\s*\d{1,2}$');
+  // ── Torneos y categorías (página /futbol) ──────────────────────────────
 
-  /// Pasa a minúsculas y quita acentos para comparar textos.
-  static String normalizar(String s) {
-    const con = 'áàäâéèëêíìïîóòöôúùüûñ';
-    const sin = 'aaaaeeeeiiiioooouuuun';
-    final b = StringBuffer();
-    for (final ch in s.toLowerCase().split('')) {
-      final i = con.indexOf(ch);
-      b.write(i >= 0 ? sin[i] : ch);
+  static Catalogo catalogo(String html) {
+    final json = _objetoJs(html, 'campeonatosXTorneo');
+    final datos = json == null
+        ? <String, dynamic>{}
+        : jsonDecode(json) as Map<String, dynamic>;
+
+    final campeonatos = <int, List<Campeonato>>{};
+    final actuales = <int>{};
+    datos.forEach((torneoId, lista) {
+      final tid = int.parse(torneoId);
+      for (final c in (lista as List).cast<Map<String, dynamic>>()) {
+        final categoria = (c['categoria'] as Map?)?['name'] as String?;
+        campeonatos
+            .putIfAbsent(tid, () => [])
+            .add(
+              Campeonato(
+                id: c['id'] as int,
+                torneoId: tid,
+                nombre: _limpiar(categoria ?? c['name'] as String),
+                deporte: _limpiar(
+                  (c['deporte'] as Map?)?['name'] as String? ?? 'Fútbol',
+                ),
+              ),
+            );
+        if ('${(c['torneo'] as Map?)?['actual']}' == '1') actuales.add(tid);
+      }
+    });
+
+    // Nombres de torneos desde el selector de la página.
+    final nombres = <int, String>{};
+    var seleccionado = -1;
+    final inicio = html.indexOf('id="la_torneo"');
+    if (inicio >= 0) {
+      final fin = html.indexOf('</select>', inicio);
+      final select = html.substring(inicio, fin < 0 ? html.length : fin);
+      for (final m in RegExp(
+        r'<option\s+value="(\d+)"([^>]*)>([^<]*)',
+      ).allMatches(select)) {
+        final id = int.parse(m.group(1)!);
+        nombres[id] = _limpiar(m.group(3)!);
+        if (m.group(2)!.contains('selected')) seleccionado = id;
+      }
     }
-    return b.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    final torneos =
+        [
+          for (final id in campeonatos.keys)
+            Torneo(
+              id: id,
+              nombre: nombres[id] ?? 'Torneo $id',
+              actual: actuales.isEmpty
+                  ? id == seleccionado
+                  : actuales.contains(id),
+            ),
+        ]..sort((a, b) {
+          if (a.actual != b.actual) return a.actual ? -1 : 1;
+          return b.id.compareTo(a.id);
+        });
+    for (final l in campeonatos.values) {
+      l.sort(_ordenCampeonatos);
+    }
+    return Catalogo(torneos: torneos, campeonatos: campeonatos);
   }
 
-  /// Devuelve la letra de categoría (A, B o C) si el texto nombra una Primera.
-  static String? letraCategoria(String texto) {
-    final m = _reCategoria.firstMatch(normalizar(texto));
-    return m?.group(1)?.toUpperCase();
+  /// Primeras primero, después mayores, después menores; alfabético.
+  static int _ordenCampeonatos(Campeonato a, Campeonato b) {
+    int peso(Campeonato c) => c.letraPrimera != null
+        ? 0
+        : c.deporte.toLowerCase().contains('menores')
+        ? 2
+        : 1;
+    final p = peso(a).compareTo(peso(b));
+    return p != 0 ? p : a.nombre.compareTo(b.nombre);
   }
 
-  /// Busca en links y selectores los IDs de campeonato de Primera A, B y C.
-  static Map<String, int> descubrirCampeonatos(String html) {
+  /// Extrae el literal `{...}` asignado a una variable JS.
+  static String? _objetoJs(String html, String variable) {
+    final i = html.indexOf(variable);
+    if (i < 0) return null;
+    final inicio = html.indexOf('{', i);
+    if (inicio < 0) return null;
+    var profundidad = 0;
+    var enString = false;
+    for (var k = inicio; k < html.length; k++) {
+      final ch = html[k];
+      if (enString) {
+        if (ch == r'\') {
+          k++;
+        } else if (ch == '"') {
+          enString = false;
+        }
+      } else if (ch == '"') {
+        enString = true;
+      } else if (ch == '{') {
+        profundidad++;
+      } else if (ch == '}') {
+        profundidad--;
+        if (profundidad == 0) return html.substring(inicio, k + 1);
+      }
+    }
+    return null;
+  }
+
+  // ── Datos de un campeonato (/liga/tabla-resultados-alt/{c}/{t}) ──────────
+
+  static DatosCampeonato campeonato(String html, {int? anio}) {
     final doc = html_parser.parse(html);
-    final encontrados = <String, int>{};
+    final posiciones = <TablaPosiciones>[];
+    var goleadores = <Goleador>[];
+    var sanciones = <Sancion>[];
+    var descripcion = '';
 
-    void registrar(String texto, String? valor) {
-      if (valor == null) return;
-      final letra = letraCategoria(texto);
-      if (letra == null || encontrados.containsKey(letra)) return;
-      final id =
-          int.tryParse(valor) ??
-          int.tryParse(_reCampeonato.firstMatch(valor)?.group(1) ?? '');
-      if (id != null) encontrados[letra] = id;
+    for (final card in doc.querySelectorAll('.alt-card')) {
+      final head = card.querySelector('.alt-card-head');
+      final titulo = _texto(head?.querySelector('span'));
+      final tabla = card.querySelector('table');
+      if (tabla == null) continue;
+      final t = titulo.toLowerCase();
+      if (t.contains('posiciones')) {
+        final tag = _texto(head?.querySelector('.alt-card-tag'));
+        if (descripcion.isEmpty) descripcion = tag;
+        posiciones.add(
+          TablaPosiciones(titulo: titulo, filas: _posiciones(tabla)),
+        );
+      } else if (t.contains('goleador')) {
+        goleadores = _goleadores(tabla);
+      } else if (t.contains('sancion')) {
+        sanciones = _sanciones(tabla);
+      }
     }
 
-    for (final a in doc.querySelectorAll('a[href*="campeonato="]')) {
-      registrar(a.text, a.attributes['href']);
-    }
-    for (final opt in doc.querySelectorAll('option')) {
-      registrar(opt.text, opt.attributes['value']);
-    }
-    return encontrados;
+    return DatosCampeonato(
+      descripcion: descripcion,
+      posiciones: posiciones,
+      jornadas: _jornadas(doc, anio ?? DateTime.now().year),
+      goleadores: goleadores,
+      sanciones: sanciones,
+    );
   }
 
-  /// Links a subpáginas del mismo campeonato (p. ej. "Goleadores").
-  static Map<Seccion, Uri> enlacesSecciones(
-    String html,
-    Uri base,
-    int campeonato,
-  ) {
-    final doc = html_parser.parse(html);
-    final res = <Seccion, Uri>{};
-    for (final a in doc.querySelectorAll('a[href]')) {
-      final href = a.attributes['href']!;
-      if (href.startsWith('#') || href.startsWith('javascript')) continue;
-      final seccion = _seccionPorTexto(normalizar(a.text));
-      if (seccion == null || res.containsKey(seccion)) continue;
-      final uri = base.resolve(href);
-      if (uri.host != base.host) continue;
-      final camp = uri.queryParameters['campeonato'];
-      if (camp != null && camp != '$campeonato') continue;
-      if (uri == base) continue;
-      res[seccion] = uri;
+  /// Índice de cada columna según el encabezado (title o texto).
+  static Map<String, int> _columnas(Element tabla) {
+    final res = <String, int>{};
+    final ths = tabla.querySelectorAll('thead th');
+    for (var i = 0; i < ths.length; i++) {
+      final th = ths[i];
+      final clave = _normalizar(th.attributes['title'] ?? _texto(th));
+      res.putIfAbsent(clave, () => i);
+      res.putIfAbsent(_normalizar(_texto(th)), () => i);
     }
     return res;
   }
 
-  static Seccion? _seccionPorTexto(String t) {
-    if (t.length > 40) return null;
-    if (RegExp(r'goleador').hasMatch(t)) return Seccion.goleadores;
-    if (RegExp(r'sancion|suspendid|tarjeta|disciplin').hasMatch(t)) {
-      return Seccion.sanciones;
+  static List<FilaPosicion> _posiciones(Element tabla) {
+    final col = _columnas(tabla);
+    final filas = <FilaPosicion>[];
+    for (final tr in tabla.querySelectorAll('tbody tr')) {
+      final tds = tr.querySelectorAll('td');
+      int? n(String clave) {
+        final i = col[clave];
+        return i == null || i >= tds.length ? null : _entero(_texto(tds[i]));
+      }
+
+      final equipo = _texto(tr.querySelector('.team-nm'));
+      if (equipo.isEmpty) continue;
+      filas.add(
+        FilaPosicion(
+          posicion: n('#') ?? filas.length + 1,
+          equipo: equipo,
+          iniciales: _texto(tr.querySelector('.team-av')).isNotEmpty
+              ? _texto(tr.querySelector('.team-av'))
+              : iniciales(equipo),
+          jugados: n('jugados'),
+          ganados: n('ganados'),
+          empatados: n('empatados'),
+          perdidos: n('perdidos'),
+          golesFavor: n('favor'),
+          golesContra: n('contra'),
+          puntos: n('puntos') ?? 0,
+        ),
+      );
     }
-    if (RegExp(r'fixture|resultado|partidos|programacion').hasMatch(t)) {
-      return Seccion.fixture;
-    }
-    if (RegExp(r'posiciones|tabla').hasMatch(t)) return Seccion.posiciones;
-    return null;
+    return filas;
   }
 
-  /// Extrae y clasifica todas las tablas con datos del documento.
-  static List<Tabla> extraerTablas(String html) {
+  static List<Goleador> _goleadores(Element tabla) {
+    final col = _columnas(tabla);
+    final res = <Goleador>[];
+    for (final tr in tabla.querySelectorAll('tbody tr')) {
+      final tds = tr.querySelectorAll('td');
+      String c(String clave) {
+        final i = col[clave];
+        return i == null || i >= tds.length ? '' : _texto(tds[i]);
+      }
+
+      final jugador = _texto(tr.querySelector('.team-nm'));
+      if (jugador.isEmpty) continue;
+      res.add(
+        Goleador(
+          posicion: _entero(c('#')) ?? res.length + 1,
+          jugador: nombrePropio(jugador),
+          equipo: nombrePropio(c('equipo')),
+          goles: _entero(c('goles')) ?? 0,
+        ),
+      );
+    }
+    return res;
+  }
+
+  static List<Sancion> _sanciones(Element tabla) {
+    final col = _columnas(tabla);
+    final res = <Sancion>[];
+    for (final tr in tabla.querySelectorAll('tbody tr')) {
+      final tds = tr.querySelectorAll('td');
+      Element? td(String clave) {
+        final i = col[clave];
+        return i == null || i >= tds.length ? null : tds[i];
+      }
+
+      String c(String clave) {
+        final t = _texto(td(clave));
+        return t == '–' || t == '-' ? '' : t;
+      }
+
+      final jugador = _texto(tr.querySelector('.team-nm'));
+      if (jugador.isEmpty) continue;
+      final badge = td('tarjeta')?.querySelector('.badge');
+      res.add(
+        Sancion(
+          jugador: nombrePropio(jugador),
+          equipo: nombrePropio(c('equipo')),
+          tarjeta: _texto(badge).isNotEmpty ? _texto(badge) : c('tarjeta'),
+          colorTarjeta: _colorDeEstilo(badge?.attributes['style']),
+          fechas: c('fechas de suspension'),
+          articulo: c('articulo'),
+          fecha: c('fecha'),
+        ),
+      );
+    }
+    return res;
+  }
+
+  static List<Jornada> _jornadas(Document doc, int anio) {
+    final res = <Jornada>[];
+    for (final round in doc.querySelectorAll('.alt-round')) {
+      final textoDia = _texto(round.querySelector('.alt-round-date'));
+      final partidos = <Partido>[];
+      for (final m in round.querySelectorAll('.alt-match')) {
+        final d = m.querySelector('.alt-match-desktop') ?? m;
+        final score = _texto(d.querySelector('.score-pill'));
+        final goles = RegExp(r'(\d+)\s*[–-]\s*(\d+)').firstMatch(score);
+        final status = d.querySelector('.amd-status');
+        final EstadoPartido estado;
+        if (status?.querySelector('.badge-fin') != null) {
+          estado = EstadoPartido.finalizado;
+        } else if ((status?.querySelector('.badge-pend')?.attributes['title'] ??
+                '')
+            .toLowerCase()
+            .contains('confirm')) {
+          estado = EstadoPartido.aConfirmar;
+        } else {
+          estado = EstadoPartido.pendiente;
+        }
+        partidos.add(
+          Partido(
+            local: _texto(d.querySelector('.amd-local')),
+            visitante: _texto(d.querySelector('.amd-visitor')),
+            hora: _texto(d.querySelector('.amd-time')),
+            estado: estado,
+            golesLocal: goles == null ? null : int.parse(goles.group(1)!),
+            golesVisitante: goles == null ? null : int.parse(goles.group(2)!),
+            detalleUrl: d
+                .querySelector('a[href*="ver-resultado"]')
+                ?.attributes['href'],
+          ),
+        );
+      }
+      res.add(
+        Jornada(
+          nombre: _texto(round.querySelector('.alt-round-badge')),
+          textoDia: textoDia,
+          dia: fechaDesdeTexto(textoDia, anio),
+          partidos: partidos,
+        ),
+      );
+    }
+    return res;
+  }
+
+  // ── Noticias (/blog) ──────────────────────────────────────────────────────
+
+  static List<Noticia> noticias(String html, Uri base) {
     final doc = html_parser.parse(html);
-    final tablas = <Tabla>[];
-    for (final table in doc.querySelectorAll('table')) {
-      // Las tablas anidadas se procesan por separado.
-      if (table.querySelector('table') != null) continue;
-      final t = _leerTabla(table);
-      if (t != null) tablas.add(t);
+    final res = <Noticia>[];
+    for (final post in doc.querySelectorAll('.blog-post')) {
+      final a = post.querySelector('.post-title a');
+      final href = a?.attributes['href'];
+      if (a == null || href == null) continue;
+      final p = post.querySelector('p');
+      p?.querySelectorAll('a').forEach((e) => e.remove());
+      final img = post.querySelector('img')?.attributes['src'];
+      res.add(
+        Noticia(
+          titulo: _texto(a),
+          resumen: (p?.text ?? '')
+              .split('\n')
+              .map((l) => l.trim())
+              .where((l) => l.isNotEmpty)
+              .join('\n'),
+          url: base.resolve(href).toString(),
+          imagen: img == null ? null : base.resolve(img).toString(),
+        ),
+      );
     }
-    return tablas;
+    return res;
   }
 
-  static Tabla? _leerTabla(Element table) {
-    final filas = <List<String>>[];
-    List<String>? encabezados;
-    for (final tr in table.querySelectorAll('tr')) {
-      final celdas = tr.children
-          .where((c) => c.localName == 'td' || c.localName == 'th')
-          .toList();
-      if (celdas.isEmpty) continue;
-      final textos = celdas.map(_textoCelda).toList();
-      final esEncabezado =
-          celdas.every((c) => c.localName == 'th') ||
-          tr.parent?.localName == 'thead';
-      if (esEncabezado && encabezados == null && filas.isEmpty) {
-        encabezados = textos;
-      } else if (textos.any((t) => t.isNotEmpty)) {
-        filas.add(textos);
-      }
-    }
-    if (filas.isEmpty) return null;
-    encabezados ??= const [];
+  // ── Utilidades ───────────────────────────────────────────────────────────
 
-    final titulo = _tituloDe(table);
-    final seccion = clasificar(titulo, encabezados, filas);
-    return Tabla(
-      titulo: titulo,
-      encabezados: encabezados,
-      filas: filas,
-      seccion: seccion,
-    );
+  static const _meses = {
+    'enero': 1,
+    'febrero': 2,
+    'marzo': 3,
+    'abril': 4,
+    'mayo': 5,
+    'junio': 6,
+    'julio': 7,
+    'agosto': 8,
+    'septiembre': 9,
+    'setiembre': 9,
+    'octubre': 10,
+    'noviembre': 11,
+    'diciembre': 12,
+  };
+
+  /// "sábado 26 de septiembre" -> DateTime(anio, 9, 26).
+  static DateTime? fechaDesdeTexto(String texto, int anio) {
+    final m = RegExp(r'(\d{1,2})\s+de\s+([a-záéíóú]+)')
+        .firstMatch(texto.toLowerCase());
+    if (m == null) return null;
+    final mes = _meses[m.group(2)];
+    if (mes == null) return null;
+    return DateTime(anio, mes, int.parse(m.group(1)!));
   }
 
-  static String _textoCelda(Element c) {
-    final texto = c.text.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (texto.isNotEmpty) return texto;
-    final img = c.querySelector('img');
-    return (img?.attributes['alt'] ?? img?.attributes['title'] ?? '').trim();
+  /// "GONZáLEZ, LEANDRO" -> "González, Leandro";
+  /// "FINCAS DE IRAOLA II" -> "Fincas de Iraola II".
+  static String nombrePropio(String s) {
+    const minusculas = {'de', 'del', 'la', 'las', 'los', 'y', 'e'};
+    final romano = RegExp(r'^(i{1,3}|iv|v|vi{1,3})$');
+    final palabras = s.toLowerCase().split(' ');
+    return [
+      for (var i = 0; i < palabras.length; i++)
+        if (palabras[i].isEmpty)
+          palabras[i]
+        else if (romano.hasMatch(palabras[i]))
+          palabras[i].toUpperCase()
+        else if (i > 0 && minusculas.contains(palabras[i]))
+          palabras[i]
+        else
+          palabras[i][0].toUpperCase() + palabras[i].substring(1),
+    ].join(' ');
   }
 
-  /// Busca un título cercano antes de la tabla (h1-h6, caption, etc.).
-  static String _tituloDe(Element table) {
-    final caption = table.querySelector('caption');
-    if (caption != null && caption.text.trim().isNotEmpty) {
-      return caption.text.trim();
+  static String iniciales(String equipo) {
+    final palabras = equipo
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (palabras.isEmpty) return '?';
+    if (palabras.length == 1) {
+      return palabras.first
+          .substring(0, palabras.first.length.clamp(0, 2))
+          .toUpperCase();
     }
-    Element? nodo = table;
-    for (var nivel = 0; nivel < 4 && nodo != null; nivel++) {
-      var prev = nodo.previousElementSibling;
-      var saltos = 0;
-      while (prev != null && saltos < 3) {
-        final t = _textoTitulo(prev);
-        if (t != null) return t;
-        if (prev.querySelector('table') != null) break;
-        prev = prev.previousElementSibling;
-        saltos++;
-      }
-      nodo = nodo.parent;
-    }
-    return '';
+    return (palabras[0][0] + palabras[1][0]).toUpperCase();
   }
 
-  static String? _textoTitulo(Element e) {
-    const etiquetas = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'};
-    Element? h = etiquetas.contains(e.localName)
-        ? e
-        : e.querySelectorAll('h1,h2,h3,h4,h5,h6').lastOrNull;
-    final clase = (e.className).toLowerCase();
-    if (h == null &&
-        (clase.contains('title') || clase.contains('titulo')) &&
-        e.text.trim().length < 80) {
-      h = e;
+  static String _texto(Element? e) =>
+      e == null ? '' : e.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  static String _limpiar(String s) =>
+      html_parser
+          .parseFragment(s)
+          .text
+          ?.replaceAll(RegExp(r'\s+'), ' ')
+          .trim() ??
+      s.trim();
+
+  static int? _entero(String s) =>
+      int.tryParse(s.replaceAll(RegExp(r'[^\d-]'), ''));
+
+  static String _normalizar(String s) {
+    const con = 'áéíóúñ';
+    const sin = 'aeioun';
+    final b = StringBuffer();
+    for (final ch in s.toLowerCase().trim().split('')) {
+      final i = con.indexOf(ch);
+      b.write(i >= 0 ? sin[i] : ch);
     }
-    final t = h?.text.replaceAll(RegExp(r'\s+'), ' ').trim();
-    return (t == null || t.isEmpty) ? null : t;
+    return b.toString().replaceAll(RegExp(r'[.\s]+'), ' ').trim();
   }
 
-  static Seccion clasificar(
-    String titulo,
-    List<String> encabezados,
-    List<List<String>> filas,
-  ) {
-    final tit = normalizar(titulo);
-    final enc = normalizar(encabezados.join(' | '));
-    final palabrasEnc = enc.split(RegExp(r'[^a-z0-9]+')).toSet();
-
-    final porTitulo = _seccionPorTexto(tit);
-    if (porTitulo != null) return porTitulo;
-
-    if (RegExp(r'sancion|suspend|tarjeta|amarilla|roja|expuls').hasMatch(enc) ||
-        palabrasEnc.contains('fechas')) {
-      return Seccion.sanciones;
-    }
-    final tienePuntos =
-        palabrasEnc.contains('pts') || palabrasEnc.contains('puntos');
-    if (!tienePuntos && RegExp(r'goleador|goles').hasMatch(enc)) {
-      return Seccion.goleadores;
-    }
-    if (tienePuntos) return Seccion.posiciones;
-    if (RegExp(r'local|visitante|resultado|partido').hasMatch(enc)) {
-      return Seccion.fixture;
-    }
-    final conResultado = filas
-        .where((f) => f.any((c) => _reResultado.hasMatch(c)))
-        .length;
-    if (conResultado > 0 && conResultado >= filas.length / 2) {
-      return Seccion.fixture;
-    }
-    return Seccion.otros;
+  static int? _colorDeEstilo(String? style) {
+    final m = RegExp(r'background:\s*#([0-9a-fA-F]{6})')
+        .firstMatch(style ?? '');
+    return m == null ? null : 0xFF000000 | int.parse(m.group(1)!, radix: 16);
   }
 }
