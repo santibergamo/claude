@@ -29,7 +29,7 @@ class TablaView extends StatelessWidget {
 
     return Card(
       clipBehavior: Clip.antiAlias,
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      margin: const EdgeInsets.fromLTRB(8, 8, 8, 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -54,11 +54,15 @@ class TablaView extends StatelessWidget {
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: DataTable(
-                headingRowHeight: 40,
-                dataRowMinHeight: 36,
-                dataRowMaxHeight: 56,
-                horizontalMargin: 12,
-                columnSpacing: 16,
+                headingRowHeight: 36,
+                dataRowMinHeight: 32,
+                dataRowMaxHeight: 48,
+                horizontalMargin: 10,
+                columnSpacing: 12,
+                dataTextStyle: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(fontSize: 13),
+                headingTextStyle: Theme.of(context).textTheme.bodySmall
+                    ?.copyWith(fontSize: 13, fontWeight: FontWeight.bold),
                 headingRowColor: WidgetStatePropertyAll(
                   scheme.surfaceContainerHighest,
                 ),
